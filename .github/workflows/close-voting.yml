@@ -1,0 +1,195 @@
+name: Close Hackathon Voting
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+  discussions: write
+
+jobs:
+  close-voting:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Count votes and update discussion
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.DISCUSSION_TOKEN }}
+          script: |
+            // Find the active voting discussion by searching for the marker
+            const searchQuery = `
+              query($owner: String!, $repo: String!) {
+                repository(owner: $owner, name: $repo) {
+                  discussions(first: 20, orderBy: {field: CREATED_AT, direction: DESC}) {
+                    nodes {
+                      id
+                      number
+                      body
+                      comments(first: 100) {
+                        nodes {
+                          id
+                          body
+                          upvoteCount
+                          reactions(first: 100) {
+                            nodes {
+                              content
+                              user {
+                                login
+                              }
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            `;
+            
+            const searchResult = await github.graphql(searchQuery, {
+              owner: context.repo.owner,
+              repo: context.repo.repo
+            });
+            
+            // Find discussion with active voting marker
+            const discussion = searchResult.repository.discussions.nodes.find(
+              d => d.body && d.body.includes('<!-- hackathon-voting-discussion-active -->')
+            );
+            
+            if (!discussion) {
+              throw new Error('No active voting discussion found. Make sure voting has been started.');
+            }
+            
+            console.log(`Found active voting discussion #${discussion.number}`);
+            
+            const comments = discussion.comments.nodes;
+            console.log(`Found ${comments.length} comments in discussion`);
+            
+            // Parse voting comments and count votes
+            const issueVotes = [];
+            
+            for (const comment of comments) {
+              // Check if this is a topic voting comment
+              const match = comment.body.match(/<!-- hackathon-topic-vote:(\d+) -->/);
+              if (!match) continue;
+              
+              const issueNumber = parseInt(match[1]);
+              
+              // Use upvoteCount for votes
+              const votes = comment.upvoteCount || 0;
+              
+              // Get users who want to work on this (rocket reaction)
+              const interestedUsers = comment.reactions.nodes
+                .filter(r => r.content === 'ROCKET')
+                .map(r => r.user.login);
+              
+              // Get issue details
+              let issueTitle = `Issue #${issueNumber}`;
+              let issueUrl = `https://github.com/${context.repo.owner}/${context.repo.repo}/issues/${issueNumber}`;
+              
+              try {
+                const issueData = await github.rest.issues.get({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: issueNumber
+                });
+                issueTitle = issueData.data.title;
+                issueUrl = issueData.data.html_url;
+              } catch (error) {
+                console.log(`Warning: Could not fetch issue #${issueNumber}`);
+              }
+              
+              issueVotes.push({
+                number: issueNumber,
+                title: issueTitle,
+                url: issueUrl,
+                votes: votes,
+                interestedUsers: interestedUsers,
+                assignedUsers: []
+              });
+              
+              console.log(`Issue #${issueNumber}: ${votes} votes, ${interestedUsers.length} interested`);
+            }
+            
+            // Sort by votes descending (top voted first)
+            issueVotes.sort((a, b) => b.votes - a.votes);
+            
+            // Smart team assignment: assign people to top-voted topics first
+            // Each person only gets assigned to ONE topic (their highest-voted preference)
+            const assignedPeople = new Set();
+            
+            for (const issue of issueVotes) {
+              for (const user of issue.interestedUsers) {
+                if (!assignedPeople.has(user)) {
+                  issue.assignedUsers.push(user);
+                  assignedPeople.add(user);
+                }
+              }
+            }
+            
+            console.log(`\nTeam assignments (prioritizing top-voted topics):`);
+            for (const issue of issueVotes) {
+              if (issue.assignedUsers.length > 0) {
+                console.log(`  #${issue.number}: ${issue.assignedUsers.join(', ')}`);
+              }
+            }
+            
+            // Build results body
+            let resultsBody = `# 🏆 Hackathon Topic Voting Results\n\n`;
+            resultsBody += `## 📊 Ranked Topics\n\n`;
+            resultsBody += `| Rank | Topic | Votes | Team |\n`;
+            resultsBody += `|:----:|:------|:-----:|:-----|\n`;
+            
+            issueVotes.forEach((issue, index) => {
+              let medal = '';
+              if (index === 0) medal = '🥇 ';
+              else if (index === 1) medal = '🥈 ';
+              else if (index === 2) medal = '🥉 ';
+              
+              const team = issue.assignedUsers.length > 0 
+                ? issue.assignedUsers.map(a => `@${a}`).join(', ')
+                : '-';
+              
+              resultsBody += `| ${medal}${index + 1} | [#${issue.number} - ${issue.title}](${issue.url}) | ${issue.votes} | ${team} |\n`;
+            });
+            
+            resultsBody += `\n<!-- hackathon-voting-discussion-closed -->\n`;
+            
+            // Update the discussion body with results
+            const updateMutation = `
+              mutation($discussionId: ID!, $body: String!) {
+                updateDiscussion(input: {discussionId: $discussionId, body: $body}) {
+                  discussion {
+                    id
+                    url
+                  }
+                }
+              }
+            `;
+            
+            await github.graphql(updateMutation, {
+              discussionId: discussion.id,
+              body: resultsBody
+            });
+            
+            console.log(`\nUpdated discussion #${discussion.number} with voting results`);
+            
+            // Assign users to issues
+            for (const issue of issueVotes) {
+              if (issue.assignedUsers.length === 0) continue;
+              
+              try {
+                await github.rest.issues.addAssignees({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: issue.number,
+                  assignees: issue.assignedUsers
+                });
+                console.log(`Assigned ${issue.assignedUsers.join(', ')} to issue #${issue.number}`);
+              } catch (error) {
+                console.log(`Warning: Could not assign users to issue #${issue.number}: ${error.message}`);
+              }
+            }
+            
+            console.log('\nVoting closed successfully!');
